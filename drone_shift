@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist, PoseStamped
+from sensor_msgs.msg import Image, NavSatFix
+from std_msgs.msg import String, Float64
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+from cv_bridge import CvBridge
+
+import cv2
+import numpy as np
+import math
+from tf_transformations import euler_from_quaternion
+from ultralytics import YOLO
+
+class SnakeSurveillanceWithDetection(Node):
+    def __init__(self):
+        super().__init__('snake_surveillance_with_detection')
+
+        # 🛫 Publisher to control drone velocity
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            '/drone1/setpoint_velocity/cmd_vel_unstamped',  # Adjust based on your drone's velocity control topic
+            10
+        )
+
+        # 📢 Publisher to announce person detection
+        self.person_pub = self.create_publisher(
+            String,
+            '/drone1/person_detected',  # You can remap this topic if needed
+            10
+        )
+
+        # 📥 Quality of service setup (best-effort for camera feeds)
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        # 🛰️ Drone pose (position + orientation) from drone0 — assumed to be your controller/reference drone
+        self.pose_sub = self.create_subscription(
+            PoseStamped,
+            '/drone0/local_position/pose',  # Could change depending on simulator setup
+            self.pose_callback,
+            qos
+        )
+
+        # 📷 Raw RGB image from drone1’s front camera
+        self.create_subscription(
+            Image,
+            '/drone1_camera1_sensor/image_raw',
+            self.image_callback,
+            qos
+        )
+
+        # 🌊 Depth image from the same camera
+        self.create_subscription(
+            Image,
+            '/drone1_camera1_sensor/depth/image_raw',
+            self.depth_callback,
+            qos
+        )
+
+        # 🌐 GPS data from drone1
+        self.create_subscription(
+            NavSatFix,
+            '/drone1/global_position/global',
+            self.gps_callback,
+            qos
+        )
+
+        # 🧭 Heading/compass direction of drone1
+        self.create_subscription(
+            Float64,
+            '/drone1/global_position/compass_hdg',
+            self.heading_callback,
+            qos
+        )
+
+        # 🔁 Main control loop running at 10Hz
+        self.timer = self.create_timer(0.1, self.control_loop)
+
+        # 🔄 Drone movement logic state machine
+        self.state = "TURN_LEFT"  # Initial state
+        self.initial_yaw = None
+        self.target_yaw = None
+        self.start_pos = None
+        self.leg_distance = 600.0  # Distance (in meters or local units) for each patrol leg
+        self.forward_direction = True
+
+        # 🤖 Load YOLOv8 model (for person detection)
+        self.model = YOLO('yolov8n.pt')
+        self.bridge = CvBridge()  # For converting ROS Image messages to OpenCV format
+
+        self.current_depth = None  # Latest depth image
+        self.current_gps = None    # Latest GPS position
+        self.current_heading = 0.0  # Current drone heading in degrees
+
+    def pose_callback(self, msg):
+        """Store current drone position and yaw (orientation)."""
+        self.current_pos = msg.pose.position
+        q = msg.pose.orientation
+        _, _, self.current_yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+
+    def image_callback(self, msg):
+        """Process camera image for person detection and publish alert if found."""
+        if self.current_depth is None or self.current_gps is None:
+            return  # Wait until both depth and GPS data are available
+
+        try:
+            frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            results = self.model.predict(source=frame, verbose=False)[0]
+
+            for box in results.boxes:
+                cls = int(box.cls[0])
+                label = self.model.names[cls]
+                conf = float(box.conf[0])
+                
+                if label != 'person' or conf < 0.55:
+                    continue  # Only respond to confident person detections
+                
+                self.get_logger().info(f"Detected: {label} with confidence: {conf:.2f}")    
+
+                # Bounding box center (to calculate relative direction)
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cx = int((x1 + x2) / 2)
+                cy = int((y1 + y2) / 2)
+
+                depth_value = self.get_depth(cx, cy)
+                if depth_value is None or depth_value <= 0.5:
+                    continue  # Ignore invalid or too-close detections
+
+                # Convert pixel to bearing angle relative to drone's current heading
+                frame_width = frame.shape[1]
+                fov_horizontal = 90.0  # Assume 90° camera field of view
+                angle_offset = ((cx - frame_width / 2) / frame_width) * fov_horizontal
+                bearing = self.current_heading + angle_offset
+
+                # Compute GPS location of the detected person
+                lat, lon = self.calculate_destination(
+                    self.current_gps.latitude,
+                    self.current_gps.longitude,
+                    depth_value,
+                    bearing
+                )
+
+                # Publish the detection
+                msg_out = String()
+                msg_out.data = f"Person detected at GPS: lat={lat:.6f}, lon={lon:.6f}"
+                self.person_pub.publish(msg_out)
+                self.get_logger().info(msg_out.data)
+
+        except Exception as e:
+            self.get_logger().error(f"Image processing error: {e}")
+
+    def depth_callback(self, msg):
+        """Receive and convert depth image."""
+        try:
+            self.current_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f"Depth error: {e}")
+
+    def gps_callback(self, msg):
+        """Receive GPS location of the drone."""
+        self.current_gps = msg
+
+    def heading_callback(self, msg):
+        """Receive compass heading (degrees)."""
+        self.current_heading = msg.data
+
+    def get_depth(self, x, y):
+        """Safely retrieve depth value at pixel (x, y)."""
+        try:
+            depth = self.current_depth[y, x]
+            if np.isnan(depth) or depth <= 0.0:
+                return None
+            return float(depth)
+        except:
+            return None
+
+    def calculate_destination(self, lat, lon, distance, bearing_deg):
+        """Calculate new GPS location given start point, distance, and bearing."""
+        R = 6378137.0  # Earth radius in meters
+        bearing = math.radians(bearing_deg)
+        lat1 = math.radians(lat)
+        lon1 = math.radians(lon)
+
+        lat2 = math.asin(math.sin(lat1) * math.cos(distance / R) +
+                         math.cos(lat1) * math.sin(distance / R) * math.cos(bearing))
+
+        lon2 = lon1 + math.atan2(math.sin(bearing) * math.sin(distance / R) * math.cos(lat1),
+                                 math.cos(distance / R) - math.sin(lat1) * math.sin(lat2))
+
+        return math.degrees(lat2), math.degrees(lon2)
+
+    def control_loop(self):
+        """Handles the drone’s patrol logic using a state machine."""
+        if not hasattr(self, 'current_pos') or not hasattr(self, 'current_yaw'):
+            return
+
+        cmd = Twist()
+
+        if self.state == "TURN_LEFT":
+            # Turn 90° left to begin patrol
+            if self.initial_yaw is None:
+                self.initial_yaw = self.current_yaw
+                self.target_yaw = self.normalize_angle(self.initial_yaw + math.radians(90))
+
+            yaw_error = self.normalize_angle(self.target_yaw - self.current_yaw)
+
+            if abs(yaw_error) > math.radians(2):
+                cmd.angular.z = 0.3 if yaw_error > 0 else -0.3
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                self.initial_yaw = None
+                self.state = "MOVE_FORWARD"
+                self.start_pos = self.current_pos
+                return
+
+        elif self.state == "TURN_AROUND":
+            # 180° turn to continue zigzag path
+            if self.initial_yaw is None:
+                self.initial_yaw = self.current_yaw
+                self.target_yaw = self.normalize_angle(self.initial_yaw + math.radians(180))
+
+            yaw_error = self.normalize_angle(self.target_yaw - self.current_yaw)
+
+            if abs(yaw_error) > math.radians(2):
+                cmd.angular.z = 0.3 if yaw_error > 0 else -0.3
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                self.initial_yaw = None
+                self.state = "MOVE_FORWARD"
+                self.start_pos = self.current_pos
+                return
+
+        elif self.state == "MOVE_FORWARD":
+            # Move in straight line for specified distance
+            dist = self.get_distance(self.start_pos, self.current_pos)
+            if dist < self.leg_distance:
+                cmd.linear.x = -2.0 if self.forward_direction else 2.0
+                self.cmd_pub.publish(cmd)
+                return
+            else:
+                self.cmd_pub.publish(Twist())  # Stop
+                self.forward_direction = not self.forward_direction
+                self.state = "TURN_AROUND"
+                return
+
+    def get_distance(self, start, current):
+        """Calculate Euclidean distance in 2D."""
+        dx = current.x - start.x
+        dy = current.y - start.y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def normalize_angle(self, angle):
+        """Normalize angle between [-π, π]."""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = SnakeSurveillanceWithDetection()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
+
